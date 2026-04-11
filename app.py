@@ -6,8 +6,13 @@ import re
 import time
 import threading
 from transformers.pipelines import pipeline
-import nltk
-from nltk.corpus import brown
+
+# Try to import sentence_transformers, fallback to simple keyword matching if not available
+try:
+    from sentence_transformers import SentenceTransformer, util
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -29,41 +34,32 @@ def log_to_firestore(row_dict):
     db.collection("responses").add(row_dict)
 # ----------------------------------
 
-@st.cache_resource
-def load_nltk_data():
-    """Download and cache NLTK data once."""
-    nltk.download('brown', quiet=True)
-    nltk.download('words', quiet=True)
-    return set(w.lower() for w in brown.words())
-
-english_vocab = load_nltk_data()
-
 STOPWORDS = {'Hassan', 'Asim', 'Ather'}
 
 def looks_like_gibberish(word):
-    # Relaxed check: Allow short words if they are alpha and not extreme repeats
-    return (
-        len(word) < 1 or  # Minimum length of 1
-        not word.isalpha() or
-        re.fullmatch(r"(.)\1{3,}", word) or  # Only reject extreme repeats (3+)
-        re.search(r'[aeiou]{4,}', word) or  # Reduce vowel threshold
-        re.search(r'[zxcvbnm]{5,}', word) or  # Reduce consonant threshold
-        (len(word) < 3 and word not in english_vocab and not any(c.isupper() for c in word))  # Allow short words with some flexibility
-    )
-
-def is_valid_response(response, cue_word):
-    tokens = response.lower().strip().split()
-    if not 1 <= len(tokens) <= 3:
-        return False
-    for token in tokens:
-        if token == cue_word.lower() or token in STOPWORDS or looks_like_gibberish(token):
-            return False
-    return True
-
-def calculate_score(label):
-    if label == "POSITIVE": return 2
-    if label == "NEGATIVE": return -1
-    return 1
+    """Fast heuristic gibberish detection using vowel-consonant patterns."""
+    word = word.lower()
+    
+    if len(word) < 2 or not word.isalpha():
+        return True
+    
+    # Must contain at least one vowel
+    if not any(v in word for v in 'aeiou'):
+        return True
+    
+    # Reject 3+ identical repeats
+    if re.fullmatch(r".*(.)\1{2,}.*", word):
+        return True
+    
+    # Reject 4+ consonants in a row
+    if re.search(r'[^aeiou]{4,}', word):
+        return True
+    
+    # Reject 3+ vowels in a row  
+    if re.search(r'[aeiou]{3,}', word):
+        return True
+    
+    return False
 
 def format_cue_word(cue):
     return f"""
@@ -74,9 +70,16 @@ def format_cue_word(cue):
 
 def format_feedback(msg, color):
     return f"""
-    <div style='text-align: center; font-size: 28px; font-weight: bold; color: {color}; padding: 10px;'>
+    <div style='text-align: center; font-size: 28px; font-weight: bold; color: {color}; padding: 10px; animation: fadeOut 3s ease-in-out forwards;'>
         {msg}
     </div>
+    <style>
+        @keyframes fadeOut {{
+            0% {{ opacity: 1; }}
+            70% {{ opacity: 1; }}
+            100% {{ opacity: 0.3; }}
+        }}
+    </style>
     """
 
 def get_safe_progress(current, total):
@@ -86,9 +89,51 @@ def get_safe_progress(current, total):
 
 @st.cache_resource
 def load_model():
-    return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+    return pipeline("sentiment-analysis", model="tabularisai/robust-sentiment-analysis")
 
 classifier = load_model()
+
+@st.cache_resource
+def load_gibberish_detector():
+    return pipeline("text-classification", model="madhurjindal/autonlp-Gibberish-Detector-492513457")
+
+gibberish_classifier = load_gibberish_detector()
+
+@st.cache_resource
+def load_similarity_model():
+    if SENTENCE_TRANSFORMERS_AVAILABLE:
+        return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+    return None
+
+similarity_model = load_similarity_model()
+
+def is_semantically_relevant(response, context, threshold=0.35):
+    """Check if response is semantically related to context using embeddings or fallback."""
+    if not response or not context:
+        return False
+    
+    # If sentence_transformers available, use AI embeddings
+    if SENTENCE_TRANSFORMERS_AVAILABLE and similarity_model:
+        emb1 = similarity_model.encode(response, convert_to_tensor=True)
+        emb2 = similarity_model.encode(context, convert_to_tensor=True)
+        similarity = util.cos_sim(emb1, emb2).item()
+        return similarity >= threshold
+    
+    # Fallback: simple keyword matching
+    response_words = set(response.lower().split())
+    context_words = set(context.lower().split())
+    
+    # Check for shared words or if response contains context word
+    shared = response_words & context_words
+    if shared:
+        return True
+    
+    # Check if any context word is in response
+    for word in context_words:
+        if len(word) > 3 and word in response.lower():
+            return True
+    
+    return False
 
 os.makedirs("results", exist_ok=True)
 
@@ -206,16 +251,24 @@ if st.session_state.phase == 1:
                 "accepted": False
             }
 
-            # Allow acceptance if sentiment is POSITIVE with high confidence, even if is_valid_response fails
+            # Check for gibberish using AI model
+            gibberish_result = gibberish_classifier(phrase)[0]
+            is_gibberish = gibberish_result['label'] == 'gibberish' and gibberish_result['score'] > 0.5
+
+            # Check semantic relevance to cue word
+            is_relevant = is_semantically_relevant(phrase, cue, threshold=0.30)
+
+            # Check sentiment (can be neutral or positive, just not negative)
+            is_negative = 'negative' in label.lower()
+
             if phrase in st.session_state.used_texts:
                 feedback.markdown(format_feedback("⚠️ Already used! Kindly use a different word", "#e67e22"), unsafe_allow_html=True)
-                time.sleep(1)
-            elif label == "NEGATIVE":
+            elif is_gibberish:
+                feedback.markdown(format_feedback("❌ That doesn't look like a real word! Try again.", "#c0392b"), unsafe_allow_html=True)
+            elif not is_relevant:
+                feedback.markdown(format_feedback("❌ Not related to the cue word! Try something relevant.", "#c0392b"), unsafe_allow_html=True)
+            elif is_negative:
                 feedback.markdown(format_feedback("❌ Negative word detected! Try again.", "#c0392b"), unsafe_allow_html=True)
-                time.sleep(1)
-            elif not is_valid_response(phrase, cue) and label != "POSITIVE":
-                feedback.markdown(format_feedback("❌ Invalid input! Please write something else", "#c0392b"), unsafe_allow_html=True)
-                time.sleep(1)
             else:
                 entry["score"] = score
                 entry["accepted"] = True
@@ -224,7 +277,6 @@ if st.session_state.phase == 1:
                 st.session_state.step += 1
                 st.session_state.start_time = None
                 feedback.markdown(format_feedback(f"✅ Sentiment: {label} ({conf:.2f}) | Score +{score}", "#27ae60"), unsafe_allow_html=True)
-                time.sleep(1)
 
             st.session_state.responses.append(entry)
             
@@ -285,16 +337,36 @@ elif st.session_state.phase == 2:
                 "accepted": False
             }
 
-            # Allow acceptance if sentiment is POSITIVE with high confidence, even if is_valid_response fails
+            # Check for gibberish using AI model
+            gibberish_result = gibberish_classifier(phrase)[0]
+            is_gibberish = gibberish_result['label'] == 'gibberish' and gibberish_result['score'] > 0.5
+
+            # Check semantic relevance to sentence context
+            is_relevant = is_semantically_relevant(phrase, sentence, threshold=0.25)
+
+            # Check sentiment
+            is_negative = 'negative' in label.lower()
+            is_positive = 'positive' in label.lower()
+
+            # ACCEPT if: positive sentiment (even if not semantically relevant)
+            # REJECT if: negative, gibberish, or neutral AND not relevant
             if phrase in st.session_state.used_texts:
                 feedback.markdown(format_feedback("⚠️ Already used! Kindly use something different.", "#e67e22"), unsafe_allow_html=True)
-                time.sleep(1)
-            elif label == "NEGATIVE":
+            elif is_gibberish:
+                feedback.markdown(format_feedback("❌ That doesn't look like a real word! Try again.", "#c0392b"), unsafe_allow_html=True)
+            elif is_negative:
                 feedback.markdown(format_feedback("❌ Negative! Try again.", "#c0392b"), unsafe_allow_html=True)
-                time.sleep(1)
-            elif not is_valid_response(phrase, sentence) and label != "POSITIVE":
-                feedback.markdown(format_feedback("❌ Invalid input! Please try something else", "#c0392b"), unsafe_allow_html=True)
-                time.sleep(1)
+            elif is_positive:
+                # Always accept positive sentiment
+                entry["score"] = score
+                entry["accepted"] = True
+                st.session_state.score += score
+                st.session_state.used_texts.add(phrase)
+                st.session_state.step += 1
+                st.session_state.start_time = None
+                feedback.markdown(format_feedback(f"✅ Sentiment: {label} ({conf:.2f}) | Score +{score}", "#27ae60"), unsafe_allow_html=True)
+            elif not is_relevant:
+                feedback.markdown(format_feedback("❌ Not related to the sentence context! Try something relevant.", "#c0392b"), unsafe_allow_html=True)
             else:
                 entry["score"] = score
                 entry["accepted"] = True
@@ -303,7 +375,6 @@ elif st.session_state.phase == 2:
                 st.session_state.step += 1
                 st.session_state.start_time = None
                 feedback.markdown(format_feedback(f"✅ Sentiment: {label} ({conf:.2f}) | Score +{score}", "#27ae60"), unsafe_allow_html=True)
-                time.sleep(1)
 
             st.session_state.responses.append(entry)
             
