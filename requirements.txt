@@ -2,7 +2,8 @@ streamlit
 pandas
 matplotlib
 transformers
-torch    # 🔍 Added this line to fix the model loading error
+torch
+torchvision
+sentence-transformers
 nltk
-gspread
-oauth2client
+firebase-admin
